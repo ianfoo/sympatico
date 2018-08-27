@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,15 +20,53 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/peterbourgon/sympatico/internal/auth"
 	"github.com/peterbourgon/sympatico/internal/dna"
 )
+
+// validator is a client that will dispatch to an external service to
+// validate a user+token cobmination.
+type validator url.URL
+
+func NewValidator(vURL string) (validator, error) {
+	u, err := url.Parse(vURL)
+	if err != nil {
+		return validator{}, errors.Wrap(err, "invalid validator URL")
+	}
+	return validator(*u), nil
+}
+
+// Validate the user+token combination.
+func (v validator) Validate(ctx context.Context, user, token string) error {
+	vals := url.Values{
+		"user":  []string{user},
+		"token": []string{token},
+	}
+	u := url.URL{
+		Scheme:   v.Scheme,
+		Host:     v.Host,
+		Path:     "/auth/validate",
+		RawQuery: vals.Encode(),
+	}
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return errors.Wrap(err, "error creating validate request")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "error validating request")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("invalid token")
+	}
+	return nil
+}
 
 func main() {
 	fs := flag.NewFlagSet("monolith", flag.ExitOnError)
 	var (
 		apiAddr = fs.String("api", "127.0.0.1:8080", "HTTP API listen address")
-		authURN = fs.String("auth-urn", "file:auth.db", "URN for auth DB")
+		authURL = fs.String("auth-url", "127.0.0.1:8081", "URL for Auth Service")
 		dnaURN  = fs.String("dna-urn", "file:dna.db", "URN for DNA DB")
 	)
 	fs.Usage = usageFor(fs, "monolith [flags]")
@@ -39,30 +78,24 @@ func main() {
 		logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	}
 
-	var authEventsTotal *prometheus.CounterVec
+	var validSvc validator
+	{
+		svc, err := NewValidator(*authURL)
+		if err != nil {
+			logger.Log("during", "NewValidator", "err", err)
+			os.Exit(1)
+		}
+		validSvc = svc
+	}
+
 	var dnaCheckDuration *prometheus.HistogramVec
 	{
-		authEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-			Subsystem: "auth",
-			Name:      "events_total",
-			Help:      "Total number of auth events.",
-		}, []string{"method", "success"})
 		dnaCheckDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Subsystem: "dna",
 			Name:      "check_duration_seconds",
 			Help:      "Time spent performing DNA subsequence checks.",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"success"})
-	}
-
-	var authsvc *auth.Service
-	{
-		authrepo, err := auth.NewSQLiteRepository(*authURN)
-		if err != nil {
-			logger.Log("during", "auth.NewSQLiteRepository", "err", err)
-			os.Exit(1)
-		}
-		authsvc = auth.NewService(authrepo, authEventsTotal)
 	}
 
 	var dnasvc *dna.Service
@@ -72,21 +105,13 @@ func main() {
 			logger.Log("during", "dna.NewSQLiteRepository", "err", err)
 			os.Exit(1)
 		}
-		dnasvc = dna.NewService(dnarepo, authsvc, dnaCheckDuration)
+		dnasvc = dna.NewService(dnarepo, validSvc, dnaCheckDuration)
 	}
 
 	var api http.Handler
 	{
 		// The HTTP API mounts endpoints to be consumed by clients.
 		r := mux.NewRouter()
-
-		// One way to make a service accessible over HTTP is to write individual
-		// handle functions that translate to and from HTTP semantics. Note that
-		// we don't bind the auth validate method, because that's only used by
-		// other components, never by clients directly.
-		r.Methods("POST").Path("/auth/signup").HandlerFunc(handleSignup(authsvc))
-		r.Methods("POST").Path("/auth/login").HandlerFunc(handleLogin(authsvc))
-		r.Methods("POST").Path("/auth/logout").HandlerFunc(handleLogout(authsvc))
 
 		// Another way to make a service accessible over HTTP is to have the
 		// service implement http.Handler directly, via a ServeHTTP method.
@@ -130,63 +155,6 @@ func main() {
 		})
 	}
 	logger.Log("exit", g.Run())
-}
-
-func handleSignup(s *auth.Service) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var (
-			user = r.URL.Query().Get("user")
-			pass = r.URL.Query().Get("pass")
-		)
-		err := s.Signup(r.Context(), user, pass)
-		if err == auth.ErrBadAuth {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "signup OK")
-	}
-}
-
-func handleLogin(s *auth.Service) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var (
-			user = r.URL.Query().Get("user")
-			pass = r.URL.Query().Get("pass")
-		)
-		token, err := s.Login(r.Context(), user, pass)
-		if err == auth.ErrBadAuth {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, token)
-	}
-}
-
-func handleLogout(s *auth.Service) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var (
-			user  = r.URL.Query().Get("user")
-			token = r.URL.Query().Get("token")
-		)
-		err := s.Logout(r.Context(), user, token)
-		if err == auth.ErrBadAuth {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "logout OK")
-	}
 }
 
 func usageFor(fs *flag.FlagSet, short string) func() {
